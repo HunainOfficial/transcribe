@@ -31,7 +31,18 @@ from job import (
 from transcribe import DEFAULT_RETRIES, DEFAULT_TIMEOUT_S
 
 
-AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".ogg", ".webm", ".flac", ".aac", ".mp4", ""}
+AUDIO_EXTS = {
+    ".wav",
+    ".mp3",
+    ".m4a",
+    ".ogg",
+    ".webm",
+    ".flac",
+    ".aac",
+    ".mp4",
+    ".gsm",
+    "",
+}
 
 
 def _utc_now() -> str:

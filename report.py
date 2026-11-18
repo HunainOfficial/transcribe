@@ -12,6 +12,8 @@ from pathlib import Path
 from job import OUT_DIR, duration_of
 
 
+DEFAULT_RATE_PER_HOUR = 0.1  # USD / audio-hour
+
 DURATION_RE = re.compile(
     r"\| Before \(convert only\) \| ([^|]+) \|\n\| After \(`[^`]+`\) \| ([^|]+) \|\n\| Saved \| ([^(]+)\(([^)]+)%\) \|"
 )
@@ -44,6 +46,18 @@ def fmt_s(seconds: float | None) -> str:
     if h:
         return f"{h}h {m:02d}m {s:02d}s"
     return f"{m}m {s:02d}s"
+
+
+def cost_usd(duration_s: float | None, rate_per_hour: float) -> float | None:
+    if duration_s is None:
+        return None
+    return (float(duration_s) / 3600.0) * rate_per_hour
+
+
+def fmt_usd(amount: float | None) -> str:
+    if amount is None:
+        return "n/a"
+    return f"${amount:.4f}"
 
 
 def load_batch_results(out_dir: Path) -> dict[str, dict]:
@@ -154,7 +168,7 @@ def collect_job(stem_dir: Path, batch_row: dict | None, batch_start: datetime | 
     return row
 
 
-def build_report(out_dir: Path) -> str:
+def build_report(out_dir: Path, rate_per_hour: float = DEFAULT_RATE_PER_HOUR) -> str:
     batch_rows = load_batch_results(out_dir)
     batch_start = load_batch_start(out_dir)
     jobs = []
@@ -168,10 +182,25 @@ def build_report(out_dir: Path) -> str:
     jobs = [j for j in jobs if j.get("stem")]
     jobs.sort(key=lambda j: j["stem"])
 
+    for j in jobs:
+        j["cost_before"] = cost_usd(j.get("before_duration_s"), rate_per_hour)
+        j["cost_after"] = cost_usd(j.get("after_duration_s"), rate_per_hour)
+        if j["cost_before"] is not None and j["cost_after"] is not None:
+            j["cost_saved"] = j["cost_before"] - j["cost_after"]
+            # Default pipeline bills both before + after API calls
+            j["cost_pipeline_both"] = j["cost_before"] + j["cost_after"]
+        else:
+            j["cost_saved"] = None
+            j["cost_pipeline_both"] = None
+
     wall_times = [j["total_wall_s"] for j in jobs if j.get("total_wall_s") is not None]
     audio_before = [j["before_duration_s"] for j in jobs if j.get("before_duration_s") is not None]
     audio_after = [j["after_duration_s"] for j in jobs if j.get("after_duration_s") is not None]
     saved = [j["saved_pct"] for j in jobs if j.get("saved_pct") is not None]
+    cost_before_total = sum(j["cost_before"] for j in jobs if j.get("cost_before") is not None)
+    cost_after_total = sum(j["cost_after"] for j in jobs if j.get("cost_after") is not None)
+    cost_saved_total = cost_before_total - cost_after_total
+    cost_pipeline_total = cost_before_total + cost_after_total
 
     # Parallel wall ≈ max(per-file); sequential estimate ≈ sum(per-file)
     parallel_est = max(wall_times) if wall_times else None
@@ -185,24 +214,59 @@ def build_report(out_dir: Path) -> str:
         "",
         f"Generated: `{datetime.now(timezone.utc).isoformat()}`",
         f"Jobs found: **{len(jobs)}**",
+        f"API rate: **${rate_per_hour:.2f} / audio-hour**",
         "",
         "## Executive summary",
         "",
-        f"| Metric | Value |",
-        f"|---|---|",
+        "| Metric | Value |",
+        "|---|---|",
         f"| Files | {len(jobs)} |",
         f"| Total audio before | {fmt_s(sum(audio_before) if audio_before else None)} |",
-        f"| Total audio after (billed) | {fmt_s(sum(audio_after) if audio_after else None)} |",
+        f"| Total audio after (smart) | {fmt_s(sum(audio_after) if audio_after else None)} |",
         f"| Total dead-air saved | {fmt_s((sum(audio_before) - sum(audio_after)) if audio_before and audio_after else None)} |",
         f"| Avg save % | {(sum(saved) / len(saved)):.1f}% |" if saved else "| Avg save % | n/a |",
+        f"| Cost if billed on **Before** only | {fmt_usd(cost_before_total)} |",
+        f"| Cost if billed on **After** only | {fmt_usd(cost_after_total)} |",
+        f"| Cost saved by smart compress | {fmt_usd(cost_saved_total)} |",
+        f"| Cost of this batch (Before+After APIs) | {fmt_usd(cost_pipeline_total)} |",
         f"| Est. sequential process time (sum of jobs) | {fmt_s(sequential_est)} |",
         f"| Est. parallel wall time (slowest job) | {fmt_s(parallel_est)} |",
         f"| Est. speedup | {speedup:.2f}x |" if speedup else "| Est. speedup | n/a |",
         "",
-        "> Parallel wall time uses each job’s measured/estimated processing time; "
-        "with `--workers 6` the batch wall clock should be close to the slowest file.",
+        "> Pricing assumes audio-hour billing at the rate above. "
+        "Default `run.py` / `batch.py` calls the API **twice** per file (before + after) "
+        "for comparison; production with `--skip-before` bills **After** only.",
         "",
-        "## Per-file audio (cost)",
+        "## API cost analysis",
+        "",
+        f"Rate: `${rate_per_hour:.2f}` per hour "
+        f"(= `${rate_per_hour / 60.0:.6f}` per minute).",
+        "",
+        "### Totals",
+        "",
+        "| Scenario | Audio | Cost |",
+        "|---|---:|---:|",
+        f"| Before only (no compress) | {fmt_s(sum(audio_before) if audio_before else None)} | {fmt_usd(cost_before_total)} |",
+        f"| After only (smart) | {fmt_s(sum(audio_after) if audio_after else None)} | {fmt_usd(cost_after_total)} |",
+        f"| Saved by smart vs before | {fmt_s((sum(audio_before) - sum(audio_after)) if audio_before and audio_after else None)} | {fmt_usd(cost_saved_total)} |",
+        f"| This run: Before + After APIs | — | {fmt_usd(cost_pipeline_total)} |",
+        "",
+        "### Per-file cost (Before vs After)",
+        "",
+        "| File | Before | After | Cost Before | Cost After | Saved $ | Both APIs |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for j in jobs:
+        lines.append(
+            f"| `{j['stem']}` | {fmt_s(j.get('before_duration_s'))} | "
+            f"{fmt_s(j.get('after_duration_s'))} | {fmt_usd(j.get('cost_before'))} | "
+            f"{fmt_usd(j.get('cost_after'))} | {fmt_usd(j.get('cost_saved'))} | "
+            f"{fmt_usd(j.get('cost_pipeline_both'))} |"
+        )
+
+    lines += [
+        "",
+        "## Per-file audio",
         "",
         "| File | Before | After | Saved | Save % | Billed min (after) |",
         "|---|---:|---:|---:|---:|---:|",
@@ -269,7 +333,8 @@ def build_report(out_dir: Path) -> str:
         "- **Single file time** = that row’s `Total job` (preprocess + API).",
         "- **All 6 sequential** ≈ sum of `Total job` (if you ran `foreach` one-by-one).",
         "- **All 6 parallel** ≈ max `Total job` (this batch with `--workers 6`), plus a little scheduling overhead.",
-        "- **API cost** tracks **After** audio minutes (smart-compressed), not Before.",
+        f"- **API cost** at `${rate_per_hour:.2f}/hour`: compare **Cost Before** vs **Cost After** above.",
+        "- Production bill with `--skip-before` ≈ **Cost After** only.",
         "- Open each `out/<id>/comparison.md` for missing-fact detail.",
         "",
     ]
@@ -285,9 +350,15 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Output markdown (default: out/full_report.md)",
     )
+    parser.add_argument(
+        "--rate",
+        type=float,
+        default=DEFAULT_RATE_PER_HOUR,
+        help=f"API USD per audio-hour (default: {DEFAULT_RATE_PER_HOUR})",
+    )
     args = parser.parse_args(argv)
     out = args.output or (OUT_DIR / "full_report.md")
-    md = build_report(OUT_DIR)
+    md = build_report(OUT_DIR, rate_per_hour=args.rate)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(md, encoding="utf-8")
     print(md)
