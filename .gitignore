@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+out/
+*.wav
+*.mp3
+*.flac
+*.webm
+*.m4a
+*.ogg
+*.opus
